@@ -1,5 +1,5 @@
 from fastapi import APIRouter, HTTPException, Query, status
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Literal
 import os
 from db.supabase_client import supabase, SupabaseConnectionError
 from models.schemas import (
@@ -21,11 +21,9 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
-# Define constants
+# Define the table name as a constant
 MEDICINES_TABLE = 'generic medicines list'
-MAX_RESULTS = 50  # Maximum number of results to return
-MAX_SIMILAR_RESULTS = 20  # Maximum number of similar results
-SUGGESTION_LIMIT = 10  # Maximum number of suggestions
+MAX_RESULTS = 15  # Maximum number of results to return
 
 def clean_search_value(value: str) -> str:
     """Clean and standardize search value."""
@@ -57,6 +55,14 @@ def safe_get(data: Optional[Dict[str, Any]], key: str, default: Any = None) -> A
     if data is None:
         return default
     return data.get(key, default)
+
+def apply_price_sort(query, sort_order: Optional[str] = None) -> Any:
+    """Apply price sorting to the query."""
+    if sort_order == "low_to_high":
+        return query.order("Cost of branded", desc=False)
+    elif sort_order == "high_to_low":
+        return query.order("Cost of branded", desc=True)
+    return query
 
 # Cache for suggestions
 @lru_cache(maxsize=1000)
@@ -126,29 +132,19 @@ async def get_suggestions(
                 detail=f"Invalid field. Must be one of: {', '.join(valid_fields)}"
             )
 
-        # Build query
-        table_query = supabase.table(MEDICINES_TABLE).select(field).limit(SUGGESTION_LIMIT)
-        
-        if query:
-            cleaned_query = clean_search_value(query)
-            table_query = table_query.ilike(field, f"%{cleaned_query}%")
-        
-        response = table_query.execute()
-        
-        if not response.data:
-            return AutocompleteResponse(suggestions=[])
-            
-        # Get unique values
-        suggestions = set()
-        for item in response.data:
-            value = item.get(field)
-            if value and isinstance(value, str):
-                suggestions.add(value)
-        
+        # Get suggestions from cache
+        suggestions = get_cached_suggestions(field, query)
+        logger.info(f"Got {len(suggestions)} suggestions for {field} with query: {query}")
+
+        # If getting type suggestions, log all available types for debugging
+        if field == "Type":
+            all_types = get_all_types()
+            logger.info(f"All available types in database: {all_types}")
+
         return AutocompleteResponse(
             suggestions=[
                 AutocompleteSuggestion(value=value, field_type=field)
-                for value in sorted(list(suggestions))[:SUGGESTION_LIMIT]
+                for value in suggestions
             ]
         )
 
@@ -167,169 +163,146 @@ async def get_suggestions(
         )
 
 @router.post("/search", response_model=SearchResponse)
-async def search_medicines(search_request: MedicineSearchRequest):
-    """Search for medicines with flexible filters."""
+async def search_medicines(
+    search_request: MedicineSearchRequest,
+    sort_order: Optional[Literal["none", "low_to_high", "high_to_low"]] = None
+):
+    """Search for medicines with flexible filters and optional price sorting."""
     try:
-        logger.info(f"Search request: {search_request}")
+        logger.info(f"Search request: {search_request}, Sort order: {sort_order}")
         
-        # Build the base query
-        base_query = supabase.table(MEDICINES_TABLE).select("*")
-        
-        # Track which filters are applied
-        applied_filters = []
-        
-        # Add filters with proper error handling and logging
+        # Build the query
+        query = supabase.table(MEDICINES_TABLE).select("*")
+
+        # Track if we're doing a type or dosage only search
+        is_type_or_dosage_search = (search_request.type or search_request.dosage) and not (search_request.name or search_request.formulation)
+
+        # Add filters
         if search_request.name:
-            name_value = clean_search_value(search_request.name)
-            if name_value:
-                # Try exact match first
-                exact_query = base_query.eq("Name", name_value)
-                exact_response = exact_query.execute()
-                
-                if exact_response.data:
-                    # If exact match found, use it
-                    exact_match = exact_response.data[0]
-                    # Get similar medicines based on formulation
-                    formulation = exact_match.get("Formulation")
-                    similar_query = base_query.neq("Name", name_value).ilike("Formulation", f"%{formulation}%")
-                    similar_response = similar_query.limit(MAX_SIMILAR_RESULTS).execute()
-                    
-                    return SearchResponse(
-                        exact_match=create_medicine_from_db(exact_match),
-                        similar_formulations=[create_medicine_from_db(m) for m in similar_response.data],
-                        Uses=exact_match.get("Uses"),
-                        Side_Effects=exact_match.get("Side Effects")
-                    )
-                else:
-                    # If no exact match, do partial match
-                    base_query = base_query.ilike("Name", f"%{name_value}%")
-                    applied_filters.append(f"name: {name_value}")
+            query = build_search_query(query, "Name", search_request.name)
+            logger.info(f"Added name filter: {search_request.name}")
         
         if search_request.formulation:
+            # For formulation, use ilike for more flexible matching
             formulation_value = clean_search_value(search_request.formulation)
-            if formulation_value:
-                # Try exact match first
-                exact_query = base_query.eq("Formulation", formulation_value)
-                exact_response = exact_query.execute()
-                
-                if exact_response.data:
-                    # If exact match found, use first as exact and rest as similar
-                    exact_match = exact_response.data[0]
-                    similar_formulations = exact_response.data[1:MAX_SIMILAR_RESULTS]
-                    
-                    # Get more similar formulations if needed
-                    if len(similar_formulations) < MAX_SIMILAR_RESULTS:
-                        remaining = MAX_SIMILAR_RESULTS - len(similar_formulations)
-                        similar_query = base_query.ilike("Formulation", f"%{formulation_value}%") \
-                            .neq("Formulation", formulation_value)
-                        similar_response = similar_query.limit(remaining).execute()
-                        similar_formulations.extend(similar_response.data)
-                    
-                    return SearchResponse(
-                        exact_match=create_medicine_from_db(exact_match),
-                        similar_formulations=[create_medicine_from_db(m) for m in similar_formulations],
-                        Uses=exact_match.get("Uses"),
-                        Side_Effects=exact_match.get("Side Effects")
-                    )
-                else:
-                    # If no exact match, do partial match
-                    base_query = base_query.ilike("Formulation", f"%{formulation_value}%")
-                    applied_filters.append(f"formulation: {formulation_value}")
+            query = query.ilike("Formulation", f"%{formulation_value}%")
+            logger.info(f"Added formulation filter: {formulation_value}")
         
-        # Handle type search with more flexibility
         if search_request.type:
+            # For type, try both exact match and partial match
             type_value = clean_search_value(search_request.type)
-            if type_value:
-                # Try exact match first
-                exact_query = base_query.eq("Type", type_value)
-                exact_response = exact_query.execute()
-                
-                if exact_response.data:
-                    # If exact match found, use those results
-                    medicines = exact_response.data
-                else:
-                    # If no exact match, try partial match with word boundaries
-                    words = type_value.split()
-                    query = base_query
-                    for word in words:
-                        query = query.ilike("Type", f"%{word}%")
-                    medicines_response = query.execute()
-                    medicines = medicines_response.data
-                    
-                    if not medicines:
-                        # If still no results, try a more lenient search
-                        base_query = base_query.ilike("Type", f"%{type_value}%")
-                    else:
-                        base_query = query
-                
-                applied_filters.append(f"type: {type_value}")
+            # Use ilike for more flexible matching
+            query = query.ilike("Type", f"%{type_value}%")
+            logger.info(f"Added type filter: {type_value}")
         
-        # Handle dosage search with more flexibility
         if search_request.dosage:
-            dosage_value = clean_search_value(search_request.dosage)
-            if dosage_value:
-                # Try exact match first
-                exact_query = base_query.eq("Dosage", dosage_value)
-                exact_response = exact_query.execute()
-                
-                if exact_response.data:
-                    # If exact match found, use those results
-                    medicines = exact_response.data
-                else:
-                    # If no exact match, try partial match with word boundaries
-                    words = dosage_value.split()
-                    query = base_query
-                    for word in words:
-                        query = query.ilike("Dosage", f"%{word}%")
-                    medicines_response = query.execute()
-                    medicines = medicines_response.data
-                    
-                    if not medicines:
-                        # If still no results, try a more lenient search
-                        base_query = base_query.ilike("Dosage", f"%{dosage_value}%")
-                    else:
-                        base_query = query
-                
-                applied_filters.append(f"dosage: {dosage_value}")
+            query = build_search_query(query, "Dosage", search_request.dosage)
+            logger.info(f"Added dosage filter: {search_request.dosage}")
 
-        # Log applied filters
-        logger.info(f"Applied filters: {', '.join(applied_filters)}")
-        
-        # Execute final query with limit
-        response = base_query.limit(MAX_RESULTS).execute()
+        # Add sorting if specified
+        if sort_order and sort_order != "none":
+            query = apply_price_sort(query, sort_order)
+            logger.info(f"Added price sorting: {sort_order}")
+
+        # Add limit for type/dosage searches
+        if is_type_or_dosage_search:
+            query = query.limit(MAX_RESULTS)
+            logger.info(f"Added limit of {MAX_RESULTS} for type/dosage search")
+
+        # Execute query
+        logger.info("Executing search query...")
+        response = query.execute()
         
         if not response.data:
-            logger.info(f"No medicines found for filters: {applied_filters}")
+            logger.info("No medicines found")
             return SearchResponse(
                 exact_match=None,
                 similar_formulations=[],
                 Uses=None,
                 Side_Effects=None
             )
-        
-        # Process results
+            
         medicines = response.data
-        logger.info(f"Found {len(medicines)} medicines matching criteria: {applied_filters}")
-        
-        # Convert to Medicine objects
-        processed_medicines = [create_medicine_from_db(m) for m in medicines]
-        
-        # Sort results by relevance if type search
-        if search_request.type and type_value:
-            processed_medicines.sort(
-                key=lambda x: (
-                    # Exact matches first
-                    x.type.lower() != type_value.lower(),
-                    # Then partial matches by length
-                    len(x.type)
+        logger.info(f"Found {len(medicines)} medicines matching the criteria")
+
+        # For type or dosage searches, return all results as similar formulations
+        if is_type_or_dosage_search:
+            logger.info("Processing type/dosage search results")
+            try:
+                processed_medicines = [create_medicine_from_db(m) for m in medicines]
+                return SearchResponse(
+                    exact_match=None,
+                    similar_formulations=processed_medicines,
+                    Uses=None,
+                    Side_Effects=None
                 )
-            )
+            except Exception as e:
+                logger.error(f"Error processing type/dosage search results: {str(e)}")
+                logger.error(traceback.format_exc())
+                raise
+
+        # Handle name/formulation searches
+        exact_match_medicine: Optional[Medicine] = None
+        exact_match_data: Optional[Dict[str, Any]] = None
+        formulation: Optional[str] = None
         
+        # If name is provided, try to find exact match by name
+        if search_request.name:
+            exact_matches = [m for m in medicines if m["Name"].lower() == search_request.name.lower()]
+            if exact_matches:
+                exact_match_data = exact_matches[0]
+                formulation = safe_get(exact_match_data, "Formulation")
+                logger.info(f"Found exact match by name: {safe_get(exact_match_data, 'Name')}")
+        # If no name match but formulation is provided, try to find exact match by formulation
+        elif search_request.formulation:
+            exact_matches = [m for m in medicines if m["Formulation"].lower() == search_request.formulation.lower()]
+            if exact_matches:
+                exact_match_data = exact_matches[0]
+                formulation = safe_get(exact_match_data, "Formulation")
+                logger.info(f"Found exact match by formulation: {formulation}")
+
+        # Get similar formulations
+        similar_formulations = []
+        if search_request.formulation:
+            # For formulation search, use all results as similar formulations
+            similar_formulations = medicines
+            logger.info(f"Using all {len(medicines)} results as similar formulations")
+        elif formulation:
+            # For name search with exact match, get medicines with similar formulation
+            similar_query = supabase.table(MEDICINES_TABLE) \
+                .select("*") \
+                .ilike("Formulation", f"%{formulation}%")
+            
+            if exact_match_data:
+                similar_query = similar_query.neq("Name", safe_get(exact_match_data, "Name"))
+            
+            # Apply sorting to similar formulations query if specified
+            if sort_order and sort_order != "none":
+                similar_query = apply_price_sort(similar_query, sort_order)
+            
+            similar_response = similar_query.execute()
+            similar_formulations = similar_response.data or []
+            logger.info(f"Found {len(similar_formulations)} similar formulations")
+        else:
+            # If no exact match, use all results as similar formulations
+            similar_formulations = medicines
+            logger.info("Using all results as similar formulations")
+
+        # Convert data to Medicine objects
+        try:
+            processed_medicines = [create_medicine_from_db(m) for m in similar_formulations]
+            if exact_match_data:
+                exact_match_medicine = create_medicine_from_db(exact_match_data)
+        except Exception as e:
+            logger.error(f"Error converting medicines data: {str(e)}")
+            logger.error(traceback.format_exc())
+            raise
+
         return SearchResponse(
-            exact_match=None,
+            exact_match=exact_match_medicine,
             similar_formulations=processed_medicines,
-            Uses=None,
-            Side_Effects=None
+            Uses=safe_get(exact_match_data, "Uses"),
+            Side_Effects=safe_get(exact_match_data, "Side Effects")
         )
 
     except SupabaseConnectionError:
