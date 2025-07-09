@@ -1,5 +1,6 @@
 import uvicorn
 import logging
+from main import app  
 
 # Configure logging
 logging.basicConfig(

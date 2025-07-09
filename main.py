@@ -1,8 +1,9 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.routing import APIRoute
 import sys
 from pathlib import Path
-from routers import finder
+from routers import finder, pharmacy_locator
 
 # Create FastAPI app
 app = FastAPI(
@@ -20,12 +21,26 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Include routers
-app.include_router(finder.router, prefix="/api/finder", tags=["finder"])
+# Include routers - removing the /api prefix for simplicity
+app.include_router(finder.router, prefix="/finder", tags=["finder"])
+app.include_router(pharmacy_locator.router, prefix="/locator", tags=["pharmacy-locator"])
 
 @app.get("/")
 async def root():
     return {"message": "Welcome to GenericBro API"}
+
+@app.get("/routes")
+def get_routes():
+    """List all available routes for debugging."""
+    routes = []
+    for route in app.routes:
+        if isinstance(route, APIRoute):
+            routes.append({
+                "path": route.path,
+                "name": route.name,
+                "methods": route.methods
+            })
+    return routes
 
 if __name__ == "__main__":
     import uvicorn

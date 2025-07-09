@@ -56,16 +56,38 @@ class Medicine(BaseModel):
     uses: str = Field(..., alias="Uses", description="Uses and indications")
     side_effects: str = Field(..., alias="Side Effects", description="Known side effects")
 
-    @validator('cost_of_branded', 'cost_of_generic', 'cost_difference')
+    @validator('cost_of_branded', 'cost_of_generic')
     def validate_prices(cls, v):
+        """Ensure prices are not negative"""
         if v is not None and v < 0:
             raise ValueError("Price cannot be negative")
         return v
 
+    @validator('cost_of_generic')
+    def validate_generic_price(cls, v, values):
+        """Ensure generic price is not higher than branded price"""
+        if v is not None and 'cost_of_branded' in values:
+            branded_price = values['cost_of_branded']
+            if v > branded_price:
+                raise ValueError("Generic price cannot be higher than branded price")
+        return v
+
+    @validator('cost_difference')
+    def calculate_cost_difference(cls, v, values):
+        """Calculate and validate cost difference"""
+        if 'cost_of_branded' in values and 'cost_of_generic' in values:
+            branded_price = values['cost_of_branded']
+            generic_price = values['cost_of_generic']
+            calculated_difference = branded_price - generic_price
+            if calculated_difference < 0:
+                raise ValueError("Cost difference cannot be negative (branded price must be higher than or equal to generic price)")
+            return calculated_difference
+        return v
+
     @validator('savings')
     def calculate_savings(cls, v, values):
-        """Calculate savings percentage if not provided"""
-        if v is None and 'cost_of_branded' in values and 'cost_of_generic' in values:
+        """Calculate savings percentage"""
+        if 'cost_of_branded' in values and 'cost_of_generic' in values:
             branded_price = float(values['cost_of_branded'])
             generic_price = float(values['cost_of_generic'])
             if branded_price > 0:

@@ -37,18 +37,61 @@ def clean_search_value(value: str) -> str:
     cleaned = cleaned.replace("'", "''")
     return cleaned
 
+def clean_type_value(value: str) -> str:
+    """Clean and standardize type value."""
+    if not value:
+        return ""
+    
+    # Debug: Log the raw input value
+    logger.info(f"Raw type value: {repr(value)}")
+    
+    # Basic cleaning: remove extra whitespace
+    cleaned = " ".join(value.split())
+    logger.info(f"After basic cleaning: {repr(cleaned)}")
+    
+    return cleaned
+
 def build_search_query(table_query, field: str, value: str, exact: bool = False) -> Any:
     """Build a search query for a field."""
     if not value:
         return table_query
+    
+    # Map the field names to database column names
+    field_mapping = {
+        "type": "Type",
+        "name": "Name",
+        "formulation": "Formulation",
+        "dosage": "Dosage",
+        # Add the capitalized versions too for backward compatibility
+        "Type": "Type",
+        "Name": "Name",
+        "Formulation": "Formulation",
+        "Dosage": "Dosage"
+    }
+    
+    db_field = field_mapping.get(field)
+    if not db_field:
+        logger.error(f"Unknown field: {field}")
+        return table_query
+    
+    if db_field == "Type":
+        cleaned_value = clean_type_value(value)
+        if not cleaned_value:
+            return table_query
+            
+        logger.info(f"Building type search query for: {repr(cleaned_value)}")
+        logger.info(f"Using database field: {db_field}")
+        
+        # Simple case-insensitive search
+        return table_query.ilike(db_field, f"%{cleaned_value}%")
     
     cleaned_value = clean_search_value(value)
     if not cleaned_value:
         return table_query
     
     if exact:
-        return table_query.eq(field, cleaned_value)
-    return table_query.ilike(field, f"%{cleaned_value}%")
+        return table_query.eq(db_field, cleaned_value)
+    return table_query.ilike(db_field, f"%{cleaned_value}%")
 
 def safe_get(data: Optional[Dict[str, Any]], key: str, default: Any = None) -> Any:
     """Safely get a value from a dictionary that might be None."""
@@ -57,7 +100,7 @@ def safe_get(data: Optional[Dict[str, Any]], key: str, default: Any = None) -> A
     return data.get(key, default)
 
 def apply_price_sort(query, sort_order: Optional[str] = None) -> Any:
-    """Apply price sorting to the query."""
+    """Apply price sorting to the query based on branded medicine price."""
     if sort_order == "low_to_high":
         return query.order("Cost of branded", desc=False)
     elif sort_order == "high_to_low":
@@ -65,9 +108,8 @@ def apply_price_sort(query, sort_order: Optional[str] = None) -> Any:
     return query
 
 # Cache for suggestions
-@lru_cache(maxsize=1000)
-def get_cached_suggestions(field: str, query: Optional[str] = None) -> List[str]:
-    """Cache suggestions to reduce database load"""
+def get_suggestions(field: str, query: Optional[str] = None) -> List[str]:
+    """Get suggestions from the database"""
     try:
         table_query = supabase.table(MEDICINES_TABLE).select(field)
         
@@ -88,13 +130,32 @@ def get_cached_suggestions(field: str, query: Optional[str] = None) -> List[str]
         
         return sorted(list(suggestions))[:10]  # Limit to 10 suggestions
     except Exception as e:
-        logger.error(f"Error in get_cached_suggestions: {str(e)}")
+        logger.error(f"Error in get_suggestions: {str(e)}")
         logger.error(traceback.format_exc())
         return []  # Return empty list instead of raising error
 
 def create_medicine_from_db(data: Dict[str, Any]) -> Medicine:
-    """Create a Medicine instance from database data."""
+    """Create a Medicine instance from database data with proper cost calculations."""
     try:
+        # Ensure cost fields are Decimal
+        if "Cost of branded" in data:
+            data["Cost of branded"] = Decimal(str(data["Cost of branded"]))
+        if "Cost of generic" in data:
+            data["Cost of generic"] = Decimal(str(data["Cost of generic"]))
+        
+        # Calculate cost difference if not present
+        if "Cost difference" not in data or data["Cost difference"] is None:
+            if "Cost of branded" in data and "Cost of generic" in data:
+                data["Cost difference"] = data["Cost of branded"] - data["Cost of generic"]
+        
+        # Calculate savings if not present
+        if "Savings" not in data or data["Savings"] is None:
+            if "Cost of branded" in data and "Cost of generic" in data:
+                branded_price = float(data["Cost of branded"])
+                generic_price = float(data["Cost of generic"])
+                if branded_price > 0:
+                    data["Savings"] = round(((branded_price - generic_price) / branded_price) * 100, 1)
+
         return Medicine.model_validate(data)
     except Exception as e:
         logger.error(f"Error creating Medicine from data: {data}")
@@ -118,7 +179,7 @@ def get_all_types() -> List[str]:
         return []
 
 @router.get("/suggestions/{field}", response_model=AutocompleteResponse)
-async def get_suggestions(
+async def get_suggestions_endpoint(
     field: str,
     query: Optional[str] = Query(default=None, min_length=0),
 ):
@@ -132,8 +193,8 @@ async def get_suggestions(
                 detail=f"Invalid field. Must be one of: {', '.join(valid_fields)}"
             )
 
-        # Get suggestions from cache
-        suggestions = get_cached_suggestions(field, query)
+        # Get suggestions
+        suggestions = get_suggestions(field, query)
         logger.info(f"Got {len(suggestions)} suggestions for {field} with query: {query}")
 
         # If getting type suggestions, log all available types for debugging
@@ -169,66 +230,89 @@ async def search_medicines(
 ):
     """Search for medicines with flexible filters and optional price sorting."""
     try:
-        logger.info(f"Search request: {search_request}, Sort order: {sort_order}")
+        # Detailed request logging
+        logger.info("=== New Search Request ===")
+        logger.info(f"Full request object: {search_request}")
+        logger.info(f"Raw request dict: {search_request.model_dump()}")
+        
+        if search_request.type:
+            logger.info("=== Type Field Details ===")
+            logger.info(f"Raw type value: {repr(search_request.type)}")
+            logger.info(f"Type value length: {len(search_request.type)}")
+            logger.info(f"Type value bytes: {[ord(c) for c in search_request.type]}")
+            logger.info(f"Type value after strip: {repr(search_request.type.strip())}")
+        
+        logger.info(f"Name filter: {repr(search_request.name) if search_request.name else 'None'}")
+        logger.info(f"Formulation filter: {repr(search_request.formulation) if search_request.formulation else 'None'}")
+        logger.info(f"Dosage filter: {repr(search_request.dosage) if search_request.dosage else 'None'}")
+        logger.info(f"Sort order: {repr(sort_order)}")
+        
+        # Get all available types for debugging
+        all_types = get_all_types()
+        logger.info(f"Available types in database: {all_types}")
         
         # Build the query
         query = supabase.table(MEDICINES_TABLE).select("*")
+        logger.info("Created initial query")
 
-        # Track if we're doing a type or dosage only search
+        # Track if we're doing a type or dosage search
         is_type_or_dosage_search = (search_request.type or search_request.dosage) and not (search_request.name or search_request.formulation)
 
-        # Add filters
-        if search_request.name:
-            query = build_search_query(query, "Name", search_request.name)
-            logger.info(f"Added name filter: {search_request.name}")
-        
-        if search_request.formulation:
-            # For formulation, use ilike for more flexible matching
-            formulation_value = clean_search_value(search_request.formulation)
-            query = query.ilike("Formulation", f"%{formulation_value}%")
-            logger.info(f"Added formulation filter: {formulation_value}")
-        
-        if search_request.type:
-            # For type, try both exact match and partial match
-            type_value = clean_search_value(search_request.type)
-            # Use ilike for more flexible matching
-            query = query.ilike("Type", f"%{type_value}%")
-            logger.info(f"Added type filter: {type_value}")
-        
-        if search_request.dosage:
-            query = build_search_query(query, "Dosage", search_request.dosage)
-            logger.info(f"Added dosage filter: {search_request.dosage}")
-
-        # Add sorting if specified
-        if sort_order and sort_order != "none":
-            query = apply_price_sort(query, sort_order)
-            logger.info(f"Added price sorting: {sort_order}")
-
-        # Add limit for type/dosage searches
-        if is_type_or_dosage_search:
-            query = query.limit(MAX_RESULTS)
-            logger.info(f"Added limit of {MAX_RESULTS} for type/dosage search")
-
-        # Execute query
-        logger.info("Executing search query...")
-        response = query.execute()
-        
-        if not response.data:
-            logger.info("No medicines found")
-            return SearchResponse(
-                exact_match=None,
-                similar_formulations=[],
-                Uses=None,
-                Side_Effects=None
-            )
+        try:
+            if search_request.type:
+                # Log the type search details
+                logger.info("=== Type Search Details ===")
+                logger.info(f"Original type value: {repr(search_request.type)}")
+                cleaned_type = clean_type_value(search_request.type)
+                logger.info(f"Cleaned type value: {repr(cleaned_type)}")
+                
+                # Build and log the type query
+                query = build_search_query(query, "type", search_request.type)
+                logger.info("Added type filter to query")
             
-        medicines = response.data
-        logger.info(f"Found {len(medicines)} medicines matching the criteria")
+            if search_request.formulation:
+                query = build_search_query(query, "formulation", search_request.formulation)
+                logger.info(f"Added formulation filter")
+            
+            if search_request.name:
+                query = build_search_query(query, "name", search_request.name)
+                logger.info(f"Added name filter")
+            
+            if search_request.dosage:
+                query = build_search_query(query, "dosage", search_request.dosage)
+                logger.info(f"Added dosage filter")
 
-        # For type or dosage searches, return all results as similar formulations
-        if is_type_or_dosage_search:
-            logger.info("Processing type/dosage search results")
-            try:
+            # Add sorting if specified
+            if sort_order and sort_order != "none":
+                query = query.order("Cost of branded", desc=(sort_order == "high_to_low"))
+                logger.info(f"Added price sorting: {sort_order}")
+
+            # Add limit for type/dosage searches
+            if is_type_or_dosage_search:
+                query = query.limit(MAX_RESULTS)
+                logger.info(f"Added limit of {MAX_RESULTS} for type/dosage search")
+
+            # Execute query and log the SQL
+            logger.info("=== Executing Query ===")
+            response = query.execute()
+            logger.info(f"Query executed successfully")
+            logger.info(f"Number of results: {len(response.data if response.data else [])}")
+
+            if not response.data:
+                logger.info("No medicines found")
+                return SearchResponse(
+                    exact_match=None,
+                    similar_formulations=[],
+                    Uses=None,
+                    Side_Effects=None
+                )
+            
+            medicines = response.data
+            logger.info(f"Found {len(medicines)} medicines")
+
+            # For type or dosage searches, return all results as similar formulations
+            if is_type_or_dosage_search:
+                logger.info("Processing type/dosage search results")
                 processed_medicines = [create_medicine_from_db(m) for m in medicines]
                 return SearchResponse(
                     exact_match=None,
@@ -236,87 +320,62 @@ async def search_medicines(
                     Uses=None,
                     Side_Effects=None
                 )
+
+            # Handle name/formulation searches
+            exact_match_medicine: Optional[Medicine] = None
+            exact_match_data: Optional[Dict[str, Any]] = None
+            
+            # Process exact matches and similar formulations
+            if search_request.name:
+                exact_matches = [m for m in medicines if m["Name"].lower() == search_request.name.lower()]
+                if exact_matches:
+                    exact_match_data = exact_matches[0]
+                    if exact_match_data and "Name" in exact_match_data:
+                        logger.info(f"Found exact match by name: {exact_match_data['Name']}")
+            elif search_request.formulation:
+                exact_matches = [m for m in medicines if m["Formulation"].lower() == search_request.formulation.lower()]
+                if exact_matches:
+                    exact_match_data = exact_matches[0]
+                    if exact_match_data and "Formulation" in exact_match_data:
+                        logger.info(f"Found exact match by formulation: {exact_match_data['Formulation']}")
+
+            # Convert data to Medicine objects
+            try:
+                if exact_match_data:
+                    exact_match_medicine = create_medicine_from_db(exact_match_data)
+                processed_medicines = [create_medicine_from_db(m) for m in medicines if m != exact_match_data]
+                logger.info(f"Processed {len(processed_medicines)} medicines")
             except Exception as e:
-                logger.error(f"Error processing type/dosage search results: {str(e)}")
+                logger.error(f"Error converting medicines data: {str(e)}")
                 logger.error(traceback.format_exc())
-                raise
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail=f"Error processing search results: {str(e)}"
+                )
 
-        # Handle name/formulation searches
-        exact_match_medicine: Optional[Medicine] = None
-        exact_match_data: Optional[Dict[str, Any]] = None
-        formulation: Optional[str] = None
-        
-        # If name is provided, try to find exact match by name
-        if search_request.name:
-            exact_matches = [m for m in medicines if m["Name"].lower() == search_request.name.lower()]
-            if exact_matches:
-                exact_match_data = exact_matches[0]
-                formulation = safe_get(exact_match_data, "Formulation")
-                logger.info(f"Found exact match by name: {safe_get(exact_match_data, 'Name')}")
-        # If no name match but formulation is provided, try to find exact match by formulation
-        elif search_request.formulation:
-            exact_matches = [m for m in medicines if m["Formulation"].lower() == search_request.formulation.lower()]
-            if exact_matches:
-                exact_match_data = exact_matches[0]
-                formulation = safe_get(exact_match_data, "Formulation")
-                logger.info(f"Found exact match by formulation: {formulation}")
+            return SearchResponse(
+                exact_match=exact_match_medicine,
+                similar_formulations=processed_medicines,
+                Uses=safe_get(exact_match_data, "Uses"),
+                Side_Effects=safe_get(exact_match_data, "Side Effects")
+            )
 
-        # Get similar formulations
-        similar_formulations = []
-        if search_request.formulation:
-            # For formulation search, use all results as similar formulations
-            similar_formulations = medicines
-            logger.info(f"Using all {len(medicines)} results as similar formulations")
-        elif formulation:
-            # For name search with exact match, get medicines with similar formulation
-            similar_query = supabase.table(MEDICINES_TABLE) \
-                .select("*") \
-                .ilike("Formulation", f"%{formulation}%")
-            
-            if exact_match_data:
-                similar_query = similar_query.neq("Name", safe_get(exact_match_data, "Name"))
-            
-            # Apply sorting to similar formulations query if specified
-            if sort_order and sort_order != "none":
-                similar_query = apply_price_sort(similar_query, sort_order)
-            
-            similar_response = similar_query.execute()
-            similar_formulations = similar_response.data or []
-            logger.info(f"Found {len(similar_formulations)} similar formulations")
-        else:
-            # If no exact match, use all results as similar formulations
-            similar_formulations = medicines
-            logger.info("Using all results as similar formulations")
-
-        # Convert data to Medicine objects
-        try:
-            processed_medicines = [create_medicine_from_db(m) for m in similar_formulations]
-            if exact_match_data:
-                exact_match_medicine = create_medicine_from_db(exact_match_data)
         except Exception as e:
-            logger.error(f"Error converting medicines data: {str(e)}")
+            logger.error("=== Error in Search Process ===")
+            logger.error(f"Error details: {str(e)}")
             logger.error(traceback.format_exc())
-            raise
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Error processing search: {str(e)}"
+            )
 
-        return SearchResponse(
-            exact_match=exact_match_medicine,
-            similar_formulations=processed_medicines,
-            Uses=safe_get(exact_match_data, "Uses"),
-            Side_Effects=safe_get(exact_match_data, "Side Effects")
-        )
-
-    except SupabaseConnectionError:
-        logger.error("Supabase connection error in search_medicines")
-        return JSONResponse(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            content={"detail": "Database connection error. Please try again later."}
-        )
     except Exception as e:
-        logger.error(f"Error in search_medicines: {str(e)}")
+        logger.error("=== Unexpected Error ===")
+        logger.error(f"Error details: {str(e)}")
         logger.error(traceback.format_exc())
         return JSONResponse(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            content={"detail": str(e)}
+            content={"detail": f"An unexpected error occurred: {str(e)}"}
         )
 
 @router.get("/medicine/{name}", response_model=Medicine)
@@ -338,4 +397,74 @@ async def get_medicine_details(name: str):
         return Medicine.model_validate(medicine)
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e)) 
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.get("/medicines/by_type", response_model=List[Medicine])
+async def get_medicines_by_type(
+    type: str = Query(..., description="Medicine type to filter by"),
+    limit: int = Query(default=50, ge=1, le=100, description="Maximum number of results to return"),
+    sort_order: Optional[Literal["none", "low_to_high", "high_to_low"]] = Query(
+        default="none",
+        description="Sort order for medicine prices"
+    )
+):
+    """
+    Get medicines by type with a simple, focused query.
+    This endpoint is optimized for type-based browsing and filtering.
+    """
+    try:
+        logger.info("=== Medicine Type Filter Request ===")
+        logger.info(f"Requested type: {repr(type)}")
+        logger.info(f"Sort order: {sort_order}")
+        
+        # Clean and validate the type
+        cleaned_type = clean_type_value(type)
+        logger.info(f"Cleaned type: {repr(cleaned_type)}")
+        
+        # Get all available types for comparison
+        all_types = get_all_types()
+        logger.info(f"Available types: {all_types}")
+        
+        # Build a simple query
+        query = (
+            supabase.table(MEDICINES_TABLE)
+            .select("*")
+            .ilike("Type", f"%{cleaned_type}%")
+            .limit(limit)
+        )
+        
+        # Apply sorting if specified
+        if sort_order and sort_order != "none":
+            query = apply_price_sort(query, sort_order)
+            logger.info(f"Applied price sorting: {sort_order}")
+        
+        logger.info("Executing type filter query...")
+        response = query.execute()
+        logger.info(f"Query executed successfully")
+        
+        if not response.data:
+            logger.info(f"No medicines found for type: {repr(cleaned_type)}")
+            return []
+            
+        # Convert to Medicine objects
+        medicines = []
+        for item in response.data:
+            try:
+                medicine = create_medicine_from_db(item)
+                medicines.append(medicine)
+            except Exception as e:
+                logger.error(f"Error converting medicine data: {str(e)}")
+                logger.error(f"Problematic data: {item}")
+                continue
+        
+        logger.info(f"Found {len(medicines)} medicines for type: {repr(cleaned_type)}")
+        return medicines
+        
+    except Exception as e:
+        logger.error("=== Error in Type Filter ===")
+        logger.error(f"Error details: {str(e)}")
+        logger.error(traceback.format_exc())
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error filtering medicines by type: {str(e)}"
+        ) 
